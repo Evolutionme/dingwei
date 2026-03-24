@@ -20,8 +20,10 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import math
+import time
 from typing import Dict, List, Tuple, Optional
 from sklearn.cluster import DBSCAN
+from scipy.spatial import cKDTree
 import cv2
 
 
@@ -95,6 +97,70 @@ def get_camera_direction(viewpoint_cam) -> torch.Tensor:
 
 
 # ===========================================================================
+# Precomputation helpers (built once, shared across all views)
+# ===========================================================================
+
+def precompute_view_data(views):
+    """Precompute camera positions, directions, and pairwise angles for all views.
+
+    Returns:
+        cam_positions: [V, 3] tensor
+        cam_directions: [V, 3] tensor
+        pairwise_angles: [V, V] tensor in degrees
+    """
+    positions = []
+    directions = []
+    for v in views:
+        positions.append(get_camera_position(v))
+        directions.append(get_camera_direction(v))
+    positions = torch.stack(positions)    # [V, 3]
+    directions = torch.stack(directions)  # [V, 3]
+
+    cos_angles = directions @ directions.T  # [V, V]
+    pairwise_angles = torch.acos(cos_angles.clamp(-1, 1)) * (180.0 / math.pi)
+
+    return positions, directions, pairwise_angles
+
+
+def build_gaussian_kdtree(gaussians):
+    """Build a KD-tree on Gaussian positions for O(log N) nearest-neighbor queries.
+
+    Returns:
+        kdtree: scipy cKDTree
+        xyz: [N, 3] tensor (GPU, detached)
+        avg_scale: [N] tensor (GPU, detached)
+    """
+    xyz = gaussians.get_xyz.detach()       # [N, 3]
+    scales = gaussians.get_scaling.detach()  # [N, 3]
+    avg_scale = scales.mean(dim=1)           # [N]
+    xyz_np = xyz.cpu().numpy()
+    kdtree = cKDTree(xyz_np)
+    return kdtree, xyz, avg_scale
+
+
+def precompute_camera_intrinsics(views):
+    """Precompute and cache proj_inv and view_inv matrices for all views.
+
+    Returns:
+        Dict[int, dict] with keys "proj_inv", "view_inv" (4x4 tensors)
+    """
+    cache = {}
+    for idx, v in enumerate(views):
+        view_mat = v.world_view_transform.T  # row-major
+        proj_mat = v.full_proj_transform.T
+        try:
+            proj_inv = torch.linalg.inv(proj_mat)
+        except Exception:
+            proj_inv = torch.inverse(proj_mat)
+        try:
+            view_inv = torch.linalg.inv(view_mat)
+        except Exception:
+            view_inv = torch.inverse(view_mat)
+        cache[idx] = {"proj_inv": proj_inv, "view_inv": view_inv}
+    return cache
+
+
+# ===========================================================================
 # Strategy 1: Ray triangulation (from GS-LPM)
 # ===========================================================================
 
@@ -160,6 +226,7 @@ def find_paired_views(
     angle_min: float = 15.0,
     angle_max: float = 60.0,
     max_pairs: int = 5,
+    pairwise_angles: torch.Tensor = None,
 ) -> List[int]:
     """Find views paired with ref_idx based on viewing angle.
     (From GS-LPM get_paired_views)
@@ -169,12 +236,27 @@ def find_paired_views(
         ref_idx: Reference view index
         angle_min/max: Acceptable angle range (degrees) between view directions
         max_pairs: Maximum number of pairs to return
+        pairwise_angles: [V, V] precomputed angle matrix (degrees), optional
 
     Returns:
         List of paired view indices, sorted by angle proximity to midpoint
     """
+    mid = (angle_min + angle_max) / 2.0
+
+    if pairwise_angles is not None:
+        # Fast path: use precomputed angle matrix (no per-view recomputation)
+        angles = pairwise_angles[ref_idx]  # [V]
+        mask = (angles >= angle_min) & (angles <= angle_max)
+        mask[ref_idx] = False
+        valid_idx = mask.nonzero(as_tuple=True)[0]
+        if len(valid_idx) == 0:
+            return []
+        diffs = (angles[valid_idx] - mid).abs()
+        _, sort_idx = diffs.sort()
+        return valid_idx[sort_idx[:max_pairs]].tolist()
+
+    # Fallback: compute on the fly
     ref_dir = get_camera_direction(views[ref_idx])
-    ref_pos = get_camera_position(views[ref_idx])
 
     candidates = []
     for i, v in enumerate(views):
@@ -184,8 +266,6 @@ def find_paired_views(
         cos_angle = (ref_dir * v_dir).sum().clamp(-1, 1)
         angle_deg = torch.acos(cos_angle).item() * 180.0 / math.pi
         if angle_min <= angle_deg <= angle_max:
-            # Prefer angles near the middle of the range
-            mid = (angle_min + angle_max) / 2.0
             candidates.append((i, abs(angle_deg - mid)))
 
     candidates.sort(key=lambda x: x[1])
@@ -218,49 +298,53 @@ def triangulate_3d_zones(
     pos1 = get_camera_position(view1)
     pos2 = get_camera_position(view2)
 
-    for r1 in regions1:
+    # Batch compute all centroid rays at once (2 calls total instead of R1*R2)
+    centroids1 = torch.tensor(
+        [[r["centroid"][0], r["centroid"][1]] for r in regions1],
+        device=device, dtype=torch.float32)  # [R1, 2]
+    centroids2 = torch.tensor(
+        [[r["centroid"][0], r["centroid"][1]] for r in regions2],
+        device=device, dtype=torch.float32)  # [R2, 2]
+    _, dirs1_all = compute_camera_rays(view1, centroids1)  # [R1, 3]
+    _, dirs2_all = compute_camera_rays(view2, centroids2)  # [R2, 3]
+
+    w0 = pos1 - pos2  # [3], constant across all pairs
+
+    for i, r1 in enumerate(regions1):
         x1, y1, w1, h1 = r1["bbox"]
-        cx1, cy1 = r1["centroid"]
+        dir1 = dirs1_all[i]  # [3]
 
-        # Shoot ray from view1 through region centroid
-        pt1 = torch.tensor([[cx1, cy1]], device=device, dtype=torch.float32)
-        _, dir1 = compute_camera_rays(view1, pt1)
-        dir1 = dir1[0]  # [3]
-
-        # Find closest region in view2 by projecting view1 centroid direction
         best_r2 = None
         best_dist = float('inf')
-        for r2 in regions2:
-            cx2, cy2 = r2["centroid"]
-            pt2 = torch.tensor([[cx2, cy2]], device=device, dtype=torch.float32)
-            _, dir2 = compute_camera_rays(view2, pt2)
-            dir2 = dir2[0]
+        best_center = None
 
-            # Closest point between two rays (midpoint method)
-            w0 = pos1 - pos2
-            a = (dir1 * dir1).sum()
-            b = (dir1 * dir2).sum()
-            c = (dir2 * dir2).sum()
-            d = (dir1 * w0).sum()
-            e = (dir2 * w0).sum()
-            denom = a * c - b * b
-            if abs(denom) < 1e-8:
-                continue
-            sc = (b * e - c * d) / denom
-            tc = (a * e - b * d) / denom
+        # Vectorized ray-ray intersection against all regions2
+        # a = dot(dir1, dir1) = 1 (normalized), c = dot(dir2, dir2) = 1
+        b_vec = dirs2_all @ dir1        # [R2], dot products
+        d_val = (dir1 * w0).sum()        # scalar
+        e_vec = (dirs2_all @ w0)         # [R2]
+        denom_vec = 1.0 - b_vec * b_vec  # [R2], since a=c=1
 
-            p1 = pos1 + sc * dir1
-            p2 = pos2 + tc * dir2
-            center = (p1 + p2) / 2.0
-            dist = (p1 - p2).norm().item()
+        valid = denom_vec.abs() > 1e-8
+        if not valid.any():
+            continue
 
-            if dist < best_dist:
-                best_dist = dist
-                best_r2 = r2
-                best_center = center
+        sc_vec = (b_vec * e_vec - d_val) / denom_vec       # [R2]
+        tc_vec = (e_vec - b_vec * d_val) / denom_vec        # [R2]
 
-        if best_r2 is not None and best_dist < 100.0:  # sanity check
-            # Radius: proportional to region size and triangulation error
+        p1_all = pos1.unsqueeze(0) + sc_vec.unsqueeze(1) * dir1.unsqueeze(0)  # [R2, 3]
+        p2_all = pos2.unsqueeze(0) + tc_vec.unsqueeze(1) * dirs2_all           # [R2, 3]
+        centers_all = (p1_all + p2_all) / 2.0                                  # [R2, 3]
+        dists_all = (p1_all - p2_all).norm(dim=1)                              # [R2]
+
+        # Mask invalid
+        dists_all[~valid] = float('inf')
+
+        best_j = dists_all.argmin().item()
+        best_dist = dists_all[best_j].item()
+        best_center = centers_all[best_j]
+
+        if best_dist < 100.0:  # sanity check
             diag1 = math.sqrt(w1**2 + h1**2)
             scale = diag1 / max(view1.image_width, view1.image_height)
             radius = max(best_dist * 2.0, scale * 10.0)
@@ -311,6 +395,9 @@ def depth_backproject_to_gaussians(
     knn_k: int = 3,
     local_radius: float = 3.0,
     max_pixels: int = 5000,
+    kdtree: cKDTree = None,
+    cached_xyz: torch.Tensor = None,
+    cached_avg_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     """Backproject defect pixels using depth, then find nearest Gaussians via kNN.
     (From CL-Splats depth_anything_lifter.py::lift)
@@ -323,6 +410,9 @@ def depth_backproject_to_gaussians(
         knn_k: Number of nearest neighbors
         local_radius: Scale-aware radius multiplier
         max_pixels: Max defect pixels to process (subsample if more)
+        kdtree: Pre-built cKDTree on Gaussian positions (optional, huge speedup)
+        cached_xyz: [N, 3] tensor, pre-cached gaussians.get_xyz (optional)
+        cached_avg_scale: [N] tensor, pre-cached mean scale (optional)
 
     Returns:
         scores: [N] float, positive evidence per Gaussian
@@ -388,36 +478,59 @@ def depth_backproject_to_gaussians(
     world_pts = cam_pts_h @ view_inv.T  # [M, 4]
     world_pts = world_pts[:, :3]  # [M, 3]
 
-    # kNN: find nearest Gaussians for each backprojected point
-    xyz = gaussians.get_xyz.detach()  # [N, 3]
-    scales = gaussians.get_scaling.detach()  # [N, 3]
-    avg_scale = scales.mean(dim=1)  # [N]
+    # Use cached Gaussian data or compute fresh
+    xyz = cached_xyz if cached_xyz is not None else gaussians.get_xyz.detach()
+    if cached_avg_scale is not None:
+        avg_scale = cached_avg_scale
+    else:
+        avg_scale = gaussians.get_scaling.detach().mean(dim=1)
 
-    # Process in chunks to avoid OOM: each row of cdist is N*4 bytes.
-    # With N=3.9M, one row ≈ 15MB, so cap chunks to fit in available VRAM.
-    bytes_per_row = N * 4
-    free_mem = torch.cuda.mem_get_info()[0] if hasattr(torch.cuda, 'mem_get_info') else 4e9
-    safe_chunk = max(16, int(free_mem * 0.3 / bytes_per_row))
-    chunk_size = min(safe_chunk, M)
-
-    scale_denom = avg_scale * local_radius + 1e-8  # [N], precompute once
     k = min(knn_k, N)
+    scale_denom = avg_scale * local_radius + 1e-8  # [N]
 
-    for start in range(0, M, chunk_size):
-        end = min(start + chunk_size, M)
-        pts_chunk = world_pts[start:end]  # [C, 3]
+    if kdtree is not None:
+        # Fast path: O(M * log N) via KD-tree
+        # Oversample in Euclidean space, then re-rank by scale-aware distance
+        oversample_k = min(max(10 * k, 30), N)
+        pts_np = world_pts.cpu().numpy()
+        euc_dists, euc_idx = kdtree.query(pts_np, k=oversample_k)  # [M, oversample_k]
 
-        dists = torch.cdist(pts_chunk, xyz)  # [C, N]
-        dists.div_(scale_denom.unsqueeze(0))  # in-place scale-aware
+        # Move to GPU for scale-aware re-ranking
+        euc_idx_t = torch.from_numpy(euc_idx).long().to(device)          # [M, oversample_k]
+        euc_dists_t = torch.from_numpy(euc_dists).float().to(device)     # [M, oversample_k]
 
-        _, knn_idx = dists.topk(k, dim=1, largest=False)  # [C, k]
-        del dists
+        # Scale-aware re-ranking
+        neighbor_scales = scale_denom[euc_idx_t]                         # [M, oversample_k]
+        scaled_dists = euc_dists_t / neighbor_scales                     # [M, oversample_k]
+        _, topk_local = scaled_dists.topk(k, dim=1, largest=False)       # [M, k]
+        knn_idx = euc_idx_t.gather(1, topk_local)                        # [M, k]
 
         # Accumulate positive evidence
         for j in range(k):
             weight = 1.0 / (j + 1)
             indices = knn_idx[:, j]
             scores.scatter_add_(0, indices, torch.full_like(indices, weight, dtype=torch.float32))
+    else:
+        # Fallback: chunked torch.cdist (O(M * N), memory-safe)
+        bytes_per_row = N * 4
+        free_mem = torch.cuda.mem_get_info()[0] if hasattr(torch.cuda, 'mem_get_info') else 4e9
+        safe_chunk = max(16, int(free_mem * 0.3 / bytes_per_row))
+        chunk_size = min(safe_chunk, M)
+
+        for start in range(0, M, chunk_size):
+            end = min(start + chunk_size, M)
+            pts_chunk = world_pts[start:end]
+
+            dists = torch.cdist(pts_chunk, xyz)  # [C, N]
+            dists.div_(scale_denom.unsqueeze(0))
+
+            _, knn_idx = dists.topk(k, dim=1, largest=False)
+            del dists
+
+            for j in range(k):
+                weight = 1.0 / (j + 1)
+                indices = knn_idx[:, j]
+                scores.scatter_add_(0, indices, torch.full_like(indices, weight, dtype=torch.float32))
 
     return scores
 
@@ -677,8 +790,29 @@ def cluster_and_expand(
     selected_xyz_np = xyz_all[selected_indices].cpu().numpy()
 
     eps_abs = cluster_eps * scene_extent
-    clustering = DBSCAN(eps=eps_abs, min_samples=cluster_min_samples).fit(selected_xyz_np)
-    labels = clustering.labels_
+    max_dbscan = 50000  # DBSCAN is O(N²); cap input size
+
+    t_clust = time.time()
+    if len(selected_xyz_np) <= max_dbscan:
+        # Direct DBSCAN
+        clustering = DBSCAN(eps=eps_abs, min_samples=cluster_min_samples).fit(selected_xyz_np)
+        labels = clustering.labels_
+    else:
+        # Subsample → DBSCAN → propagate labels via nearest-neighbor
+        rng = np.random.RandomState(42)
+        sub_idx = rng.choice(len(selected_xyz_np), max_dbscan, replace=False)
+        sub_pts = selected_xyz_np[sub_idx]
+        clustering = DBSCAN(eps=eps_abs, min_samples=cluster_min_samples).fit(sub_pts)
+        sub_labels = clustering.labels_
+
+        # Propagate: assign each remaining point to the nearest sub-sampled point's label
+        sub_tree = cKDTree(sub_pts)
+        dists, nn_idx = sub_tree.query(selected_xyz_np, k=1)
+        labels = sub_labels[nn_idx]
+        # Points far from any subsample cluster center stay isolated
+        labels[dists > eps_abs] = -1
+    print(f"    [cluster] DBSCAN ({len(selected_xyz_np)} pts, eps={eps_abs:.3f}): "
+          f"{time.time()-t_clust:.1f}s", flush=True)
 
     # Build target mask
     keep = torch.from_numpy(labels != -1 if remove_isolated else np.ones(len(labels), dtype=bool))
@@ -688,27 +822,25 @@ def cluster_and_expand(
     if len(target_global_idx) > 0:
         target_mask[target_global_idx] = True
 
-    # Context ring via chunked distance computation
+    # Context ring via KD-tree radius query (no large distance matrices)
     context_mask = torch.zeros(N, dtype=torch.bool, device=device)
     if target_mask.any():
-        target_xyz = xyz_all[target_mask]  # [T, 3]
-        T = target_xyz.shape[0]
+        t_ctx = time.time()
+        target_xyz_np = xyz_all[target_mask].cpu().numpy()
         expand_dist = context_expand_ratio * scene_extent
 
-        # Dynamic chunk size: each row of cdist is T*4 bytes
-        bytes_per_row = T * 4
-        free_mem = torch.cuda.mem_get_info()[0] if hasattr(torch.cuda, 'mem_get_info') else 4e9
-        chunk_size = max(64, min(8192, int(free_mem * 0.3 / max(bytes_per_row, 1))))
+        # Build KD-tree on target Gaussians
+        target_tree = cKDTree(target_xyz_np)
 
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            chunk = xyz_all[start:end]
-            dists = torch.cdist(chunk.unsqueeze(0), target_xyz.unsqueeze(0)).squeeze(0)
-            min_dists = dists.min(dim=1).values
-            context_mask[start:end] |= (min_dists <= expand_dist)
-            del dists
+        # Query ALL Gaussians: find if any target neighbor is within expand_dist
+        all_xyz_np = xyz_all.cpu().numpy()
+        near_dists, _ = target_tree.query(all_xyz_np, k=1, workers=-1)  # [N], parallel
+        context_idx = np.where(near_dists <= expand_dist)[0]
+        context_mask[torch.from_numpy(context_idx).long().to(device)] = True
 
         context_mask = context_mask & (~target_mask)
+        print(f"    [context] ring expand ({target_mask.sum().item()} targets, "
+              f"dist={expand_dist:.3f}): {time.time()-t_ctx:.1f}s", flush=True)
 
     protect_mask = ~(target_mask | context_mask)
     return target_mask, context_mask, protect_mask
@@ -760,8 +892,22 @@ def run_full_localization(
     device = gaussians.get_xyz.device
     per_view_scores = {}
 
+    # ---- Precomputation (one-time cost, shared across all views) ----
+    t_pre = time.time()
+
+    # 1) Pairwise camera angles for fast paired-view lookup
+    _, _, pairwise_angles = precompute_view_data(views)
+
+    # 2) KD-tree on Gaussian positions for O(log N) kNN queries
+    kdtree, cached_xyz, cached_avg_scale = build_gaussian_kdtree(gaussians)
+
+    print(f"    [precompute] camera angles + KD-tree ({N/1e6:.1f}M Gs): "
+          f"{time.time()-t_pre:.1f}s", flush=True)
+
+    # ---- Per-view localization ----
     num_views = len(defect_view_indices)
     for vi, vidx in enumerate(defect_view_indices):
+        t_view = time.time()
         print(f"    Localization view {vi+1}/{num_views} (idx={vidx})", end="", flush=True)
         result = analysis_results[vidx]
         view = views[vidx]
@@ -772,16 +918,19 @@ def run_full_localization(
         defect_regions = result.get("defect_regions", [])
 
         view_strategies = {}
+        timings = {}
 
         with torch.no_grad():
             # --- Strategy 1: Ray triangulation ---
             if enable_ray:
+                t0 = time.time()
                 ray_scores = torch.zeros(N, device=device)
                 paired = find_paired_views(
                     views, vidx,
                     angle_min=_getparam(loc_params, "ray_pair_angle_min", 15.0),
                     angle_max=_getparam(loc_params, "ray_pair_angle_max", 60.0),
                     max_pairs=_getparam(loc_params, "ray_max_pairs", 5),
+                    pairwise_angles=pairwise_angles,
                 )
                 for pidx in paired:
                     p_result = analysis_results.get(pidx)
@@ -795,9 +944,11 @@ def run_full_localization(
                         zone_scores = find_gaussians_in_zones(gaussians, zones)
                         ray_scores = torch.max(ray_scores, zone_scores)
                 view_strategies["ray"] = ray_scores
+                timings["ray"] = time.time() - t0
 
             # --- Strategy 2: Depth backprojection ---
             if enable_depth:
+                t0 = time.time()
                 depth_img = render_pkg.get("depth", None)
                 if depth_img is not None and depth_img.device.type == 'cpu':
                     depth_img = depth_img.cuda()
@@ -805,11 +956,16 @@ def run_full_localization(
                     view, defect_mask, depth_img, gaussians,
                     knn_k=_getparam(loc_params, "depth_knn_k", 3),
                     local_radius=_getparam(loc_params, "depth_local_radius", 3.0),
+                    kdtree=kdtree,
+                    cached_xyz=cached_xyz,
+                    cached_avg_scale=cached_avg_scale,
                 )
                 view_strategies["depth"] = depth_scores
+                timings["depth"] = time.time() - t0
 
             # --- Strategy 3: Contribution statistics ---
             if enable_contrib:
+                t0 = time.time()
                 # Ensure radii on correct device for contribution scoring
                 gpu_pkg = {}
                 for pk, pv in render_pkg.items():
@@ -819,9 +975,11 @@ def run_full_localization(
                     min_overlap=_getparam(loc_params, "contribution_min_overlap", 0.1),
                 )
                 view_strategies["contrib"] = contrib_scores
+                timings["contrib"] = time.time() - t0
 
         # --- Strategy 4: Gradient attribution (needs gradients, may OOM) ---
         if enable_grad:
+            t0 = time.time()
             try:
                 grad_scores = compute_gradient_attribution(
                     gaussians, view, defect_mask, render_fn, pipe, background,
@@ -830,17 +988,19 @@ def run_full_localization(
                     use_trained_exp=use_trained_exp,
                 )
                 view_strategies["grad"] = grad_scores
+                timings["grad"] = time.time() - t0
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if "out of memory" in str(e).lower() or "CUDA" in str(e):
                     if vi == 0:
-                        print(" [WARN: gradient attribution OOM, disabling for remaining views]", end="")
+                        print(" [WARN: gradient attribution OOM, disabling]", end="")
                     enable_grad = False
                     torch.cuda.empty_cache()
                 else:
                     raise
 
         strategies_used = list(view_strategies.keys())
-        print(f" -> {strategies_used}")
+        timing_str = " ".join(f"{k}={v:.2f}s" for k, v in timings.items())
+        print(f" -> {strategies_used} ({timing_str}) [{time.time()-t_view:.1f}s]", flush=True)
         per_view_scores[vidx] = view_strategies
 
     # Multi-strategy + multi-view fusion

@@ -342,7 +342,7 @@ def run_local_refinement(
 # Evaluation
 # ============================================================================
 
-def refine_eval(scene, gaussians, pipe, background, tb_writer, refine_tag):
+def refine_eval(scene, gaussians, pipe, background, tb_writer, refine_tag, separate_sh=False):
     """Quick evaluation on test cameras after refinement."""
     torch.cuda.empty_cache()
     test_cams = scene.getTestCameras()
@@ -356,7 +356,7 @@ def refine_eval(scene, gaussians, pipe, background, tb_writer, refine_tag):
 
     for cam in test_cams:
         with torch.no_grad():
-            render_pkg = render(cam, gaussians, pipe, background)
+            render_pkg = render(cam, gaussians, pipe, background, separate_sh=separate_sh)
             image = render_pkg["render"]
             gt = cam.original_image[:3, :, :].cuda()
 
@@ -525,7 +525,8 @@ def main():
     # ========== Evaluation ==========
     if not args.skip_eval and not args.skip_refine:
         refine_eval(scene, gaussians, pipeline, background,
-                    tb_writer, args.refine_tag)
+                    tb_writer, args.refine_tag,
+                    separate_sh=SPARSE_ADAM_AVAILABLE)
 
     if tb_writer:
         tb_writer.flush()
